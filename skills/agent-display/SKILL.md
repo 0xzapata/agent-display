@@ -29,6 +29,26 @@ description: Give an agent its own macOS virtual display for computer-use, brows
 
 All CLI commands print one JSON line on success and exit non-zero with a message on stderr on failure.
 
+## Let the user watch: serve
+
+- `display_serve {"name": ...}` or `agent-display serve NAME` starts a browser viewer that only the
+  user's own Tailscale devices can reach. Pass `"open": true` / `--open` to open it on this Mac.
+- Give the user the `url` from the result. The full link with its access token is in `linkFile`.
+  Never print the token or put it in a message, a log, or a commit.
+- `display_unserve` stops the viewer. Removing the display stops it too.
+
+## Run on another machine: host
+
+- Every MCP tool takes an optional `host`, and every CLI command takes `--host HOST`. Use a host
+  only when the user names it or the task says where the work runs. Do not pick hosts yourself.
+- A host works after `agent-display setup HOST`. On "not installed on HOST" or a version mismatch,
+  run that command once, then retry.
+- A Linux host gives each display its own pointer and keyboard, so click-driven work there does
+  not disturb the user. Prefer it for long computer-use tasks when the user has such a host.
+- On a Linux host, `open` takes a command (`chromium`, `firefox`), and the display is 1x only.
+- Screenshots and recordings from a host are saved on this machine.
+- If ssh prints a Tailscale check link, show the link to the user and wait. Do not retry in a loop.
+
 ## Defaults and sizes
 
 - Default size is 1440x900 points at 1x. Keep it: 1x screenshots have 4x fewer pixels than HiDPI,
@@ -40,7 +60,7 @@ All CLI commands print one JSON line on success and exit non-zero with a message
 
 ## Limits you must respect
 
-- macOS has one mouse pointer and one keyboard focus for all displays. Clicking or typing on your
+- On macOS there is one mouse pointer and one keyboard focus for all displays. Clicking or typing on your
   display still moves the user's pointer and can take focus. For browsers, prefer Playwright or the
   Chrome DevTools Protocol, which do not move the pointer. Warn the user before long click-driven work.
 - `open` needs Accessibility permission, and `shot`/`record` need Screen Recording permission, for the

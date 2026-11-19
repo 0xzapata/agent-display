@@ -7,7 +7,12 @@
 //   agent-display shot NAME [PATH]                          PNG of that display only
 //   agent-display record NAME PATH [--seconds N]            .mov of that display only (default 10 s)
 //   agent-display open NAME APP                             launch APP, move its window onto NAME
+//   agent-display serve NAME [--open] [--show-link]         tailnet-only browser viewer (needs screen-relay)
+//   agent-display unserve NAME                              stop the viewer
+//   agent-display setup HOST                                install on a Linux host over ssh
 //   agent-display mcp                                       MCP server (stdio) exposing the above
+//
+// Add `--host HOST` to any display command to run it on a host prepared with `setup`.
 //
 // Build: clang -fobjc-arc -framework AppKit -framework CoreGraphics agent-display.m -o agent-display
 //
@@ -17,6 +22,11 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <spawn.h>
 #import <sys/wait.h>
+#import <sys/socket.h>
+#import <netinet/in.h>
+
+static NSString *const kVersion = @"0.2.0";      // must match VERSION in agent-display-linux.mjs
+static NSString *const kScreenRelay = @"0.1.2";  // the screen-relay version that `setup` installs
 
 @interface CGVirtualDisplayDescriptor : NSObject
 @property (strong) NSString *name;
@@ -86,6 +96,10 @@ static NSString *pidPath(NSString *name) {
   return [dir stringByAppendingPathComponent:[safe stringByAppendingString:@".pid"]];
 }
 
+static NSString *statePath(NSString *key, NSString *ext) {
+  return [[pidPath(key) stringByDeletingPathExtension] stringByAppendingPathExtension:ext];
+}
+
 static unsigned fnv1a(NSString *s) {  // stable serial per name, so macOS remembers the arrangement
   unsigned h = 2166136261u;
   for (const char *p = s.UTF8String; *p; p++) h = (h ^ (unsigned char)*p) * 16777619u;
@@ -101,15 +115,24 @@ static int runTool(NSString *path, NSArray *args) {
 // ---------- up / run ----------
 
 static CGVirtualDisplay *gDisplay;  // the display lives exactly as long as this object
-static NSString *gPidFile;
+static NSString *gPidFile, *gName, *gSelf;
 
 static void cleanupAndExit(int code) {
+  if (gName && [NSFileManager.defaultManager fileExistsAtPath:statePath(gName, @"serve")]) {  // stop its viewer too
+    NSTask *t = [NSTask new];
+    t.executableURL = [NSURL fileURLWithPath:gSelf];
+    t.arguments = @[@"unserve", gName];
+    t.standardOutput = NSFileHandle.fileHandleWithNullDevice;
+    if ([t launchAndReturnError:nil]) [t waitUntilExit];
+  }
   if (gPidFile) unlink(gPidFile.fileSystemRepresentation);
   exit(code);
 }
 
 static int cmdUp(NSString *name, unsigned w, unsigned h, BOOL hidpi, char **childArgv) {
   if (displayNamed(name)) return fail([NSString stringWithFormat:@"a display named \"%@\" already exists", name], 1);
+
+  gName = name;
 
   // Place it right of every existing display, so several agent displays line up in a row.
   CGFloat right = 0;
@@ -276,8 +299,8 @@ static int cmdOpen(NSString *name, NSString *app) {
 // Each tool call runs this binary as a subprocess (fresh display list). Displays created over MCP
 // are removed when the MCP client disconnects, so a finished agent session leaves nothing behind.
 
-static NSString *gSelf;
 static NSMutableArray<NSTask *> *gHolders;
+static NSMutableArray<NSArray *> *gRemote;  // [host, name] of displays created on other hosts
 
 static NSDictionary *callSelf(NSArray *args) {
   NSTask *t = [NSTask new];
@@ -285,6 +308,7 @@ static NSDictionary *callSelf(NSArray *args) {
   t.arguments = args;
   NSPipe *out = [NSPipe pipe], *err = [NSPipe pipe];
   t.standardOutput = out; t.standardError = err;
+  t.standardInput = NSFileHandle.fileHandleWithNullDevice;  // stdin is the JSON-RPC stream
   [t launchAndReturnError:nil];
   NSData *o = [out.fileHandleForReading readDataToEndOfFile], *e = [err.fileHandleForReading readDataToEndOfFile];
   [t waitUntilExit];
@@ -293,7 +317,9 @@ static NSDictionary *callSelf(NSArray *args) {
 }
 
 static NSDictionary *tool(NSString *name, NSString *desc, NSDictionary *props, NSArray *required) {
-  return @{@"name": name, @"description": desc, @"inputSchema": @{@"type": @"object", @"properties": props, @"required": required}};
+  NSMutableDictionary *p = [props mutableCopy];
+  p[@"host"] = @{@"type": @"string", @"description": @"Optional. Run on this tailnet host (prepared with `agent-display setup HOST`), e.g. a Linux VPS. Default: this Mac"};
+  return @{@"name": name, @"description": desc, @"inputSchema": @{@"type": @"object", @"properties": p, @"required": required}};
 }
 
 static NSArray *mcpTools(void) {
@@ -309,7 +335,10 @@ static NSArray *mcpTools(void) {
     tool(@"display_record", @"Record one display to a .mov file.",
          @{@"name": nameP, @"path": str, @"seconds": @{@"type": @"integer", @"description": @"default 10, max 600"}}, @[@"name", @"path"]),
     tool(@"display_open_app", @"Launch an app (or bring it forward) and move its first window onto the display.",
-         @{@"name": nameP, @"app": @{@"type": @"string", @"description": @"App name, e.g. Google Chrome"}}, @[@"name", @"app"]),
+         @{@"name": nameP, @"app": @{@"type": @"string", @"description": @"App name, e.g. Google Chrome. On a Linux host: a command, e.g. chromium"}}, @[@"name", @"app"]),
+    tool(@"display_serve", @"Start a browser viewer for the display, reachable only from the user's own Tailscale devices. Returns the URL and the path of a private file that holds the full link with its access token. Never print the token.",
+         @{@"name": nameP, @"open": @{@"type": @"boolean", @"description": @"Open the viewer in the user's browser on this Mac"}}, @[@"name"]),
+    tool(@"display_unserve", @"Stop the browser viewer of a display.", @{@"name": nameP}, @[@"name"]),
   ];
 }
 
@@ -317,16 +346,30 @@ static NSDictionary *mcpCall(NSString *tname, NSDictionary *a) {
   NSString *name = [a[@"name"] isKindOfClass:NSString.class] ? a[@"name"] : nil;
   if (![tname isEqualToString:@"display_list"] && !name.length) return @{@"ok": @NO, @"text": @"name is required"};
 
-  if ([tname isEqualToString:@"display_list"]) return callSelf(@[@"list"]);
+  NSString *host = [a[@"host"] isKindOfClass:NSString.class] && [a[@"host"] length] ? a[@"host"] : nil;
+  NSArray *(^at)(NSArray *) = ^(NSArray *args) { return host ? [args arrayByAddingObjectsFromArray:@[@"--host", host]] : args; };
+
+  if ([tname isEqualToString:@"display_list"]) return callSelf(at(@[@"list"]));
+  if ([tname isEqualToString:@"display_serve"]) return callSelf(at([a[@"open"] boolValue] ? @[@"serve", name, @"--open"] : @[@"serve", name]));
+  if ([tname isEqualToString:@"display_unserve"]) return callSelf(at(@[@"unserve", name]));
+  if (host && [tname isEqualToString:@"display_remove"]) {
+    [gRemote removeObject:@[host, name]];
+    return callSelf(at(@[@"down", name]));
+  }
+  if (host && [tname isEqualToString:@"display_create"]) {
+    NSDictionary *r = callSelf(at(@[@"up", name, @"--size", a[@"size"] ?: @"1440x900"]));
+    if ([r[@"ok"] boolValue]) [gRemote addObject:@[host, name]];
+    return r;
+  }
   if ([tname isEqualToString:@"display_remove"]) {
     for (NSTask *t in [gHolders copy]) if ([t.arguments[1] isEqualToString:name]) { [t terminate]; [t waitUntilExit]; [gHolders removeObject:t]; }
     return @{@"ok": @YES, @"text": [NSString stringWithFormat:@"removed %@", name]};
   }
-  if ([tname isEqualToString:@"display_screenshot"]) return callSelf(@[@"shot", name]);
-  if ([tname isEqualToString:@"display_open_app"]) return callSelf(@[@"open", name, a[@"app"] ?: @""]);
+  if ([tname isEqualToString:@"display_screenshot"]) return callSelf(at(@[@"shot", name]));
+  if ([tname isEqualToString:@"display_open_app"]) return callSelf(at(@[@"open", name, a[@"app"] ?: @""]));
   if ([tname isEqualToString:@"display_record"]) {
     int secs = MAX(1, MIN(600, a[@"seconds"] ? [a[@"seconds"] intValue] : 10));
-    return callSelf(@[@"record", name, a[@"path"] ?: @"", @"--seconds", @(secs).stringValue]);
+    return callSelf(at(@[@"record", name, a[@"path"] ?: @"", @"--seconds", @(secs).stringValue]));
   }
   if ([tname isEqualToString:@"display_create"]) {
     NSMutableArray *args = [@[@"up", name, @"--size", a[@"size"] ?: @"1440x900"] mutableCopy];
@@ -336,6 +379,7 @@ static NSDictionary *mcpCall(NSString *tname, NSDictionary *a) {
     t.arguments = args;
     NSPipe *out = [NSPipe pipe], *err = [NSPipe pipe];
     t.standardOutput = out; t.standardError = err;
+    t.standardInput = NSFileHandle.fileHandleWithNullDevice;
     [t launchAndReturnError:nil];
     NSData *line = [out.fileHandleForReading availableData];  // `up` prints one JSON line once the display exists
     if (!line.length) {
@@ -350,6 +394,7 @@ static NSDictionary *mcpCall(NSString *tname, NSDictionary *a) {
 
 static int cmdMcp(void) {
   gHolders = [NSMutableArray array];
+  gRemote = [NSMutableArray array];
   char *buf = NULL;
   size_t cap = 0;
   while (getline(&buf, &cap, stdin) > 0) {
@@ -372,7 +417,7 @@ static int cmdMcp(void) {
           NSData *png = [NSData dataWithContentsOfFile:j[@"path"]];
           if (png) [content addObject:@{@"type": @"image", @"mimeType": @"image/png", @"data": [png base64EncodedStringWithOptions:0]}];
         }
-        result = @{@"content": content, @"isError": @(![r[@"ok"] boolValue])};
+        result = @{@"content": content, @"isError": [r[@"ok"] boolValue] ? @NO : @YES};
       }
       NSDictionary *resp = result ? @{@"jsonrpc": @"2.0", @"id": req[@"id"], @"result": result}
                                   : @{@"jsonrpc": @"2.0", @"id": req[@"id"], @"error": @{@"code": @-32601, @"message": @"method not found"}};
@@ -380,7 +425,226 @@ static int cmdMcp(void) {
     }
   }
   for (NSTask *t in gHolders) { [t terminate]; [t waitUntilExit]; }  // client gone: remove its displays
+  for (NSArray *r in gRemote) callSelf(@[@"down", r[1], @"--host", r[0]]);
   return 0;
+}
+
+// ---------- serve (screen-relay + Tailscale Serve) ----------
+// screen-relay streams one display to a browser and takes input for it. It listens on loopback and
+// demands a token. Tailscale Serve puts HTTPS in front, reachable only from the user's own tailnet.
+
+static NSString *findTool(NSString *name) {
+  NSMutableArray *dirs = [[(NSProcessInfo.processInfo.environment[@"PATH"] ?: @"") componentsSeparatedByString:@":"] mutableCopy];
+  [dirs addObjectsFromArray:@[@"/opt/homebrew/bin", @"/usr/local/bin", [NSHomeDirectory() stringByAppendingPathComponent:@".npm-global/bin"]]];
+  NSString *nvm = [NSHomeDirectory() stringByAppendingPathComponent:@".nvm/versions/node"];
+  NSArray *versions = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:nvm error:nil] sortedArrayUsingSelector:@selector(compare:)];
+  for (NSString *v in versions.reverseObjectEnumerator) [dirs addObject:[NSString stringWithFormat:@"%@/%@/bin", nvm, v]];
+  for (NSString *d in dirs) {
+    NSString *p = [d stringByAppendingPathComponent:name];
+    if (d.length && [NSFileManager.defaultManager isExecutableFileAtPath:p]) return p;
+  }
+  return nil;
+}
+
+// Run a tool and wait. `input` feeds stdin. `out` captures stdout; without it stdout is inherited,
+// or dropped when `quiet`.
+static int runCmd(NSString *path, NSArray *args, NSData *input, NSData **out, BOOL quiet) {
+  NSTask *t = [NSTask new];
+  t.executableURL = [NSURL fileURLWithPath:path];
+  t.arguments = args;
+  NSMutableDictionary *env = [NSProcessInfo.processInfo.environment mutableCopy];
+  env[@"PATH"] = [NSString stringWithFormat:@"%@:%@", path.stringByDeletingLastPathComponent, env[@"PATH"] ?: @"/usr/bin:/bin"];  // node scripts find `node`
+  t.environment = env;
+  NSPipe *inPipe = input ? [NSPipe pipe] : nil, *outPipe = out ? [NSPipe pipe] : nil;
+  if (inPipe) t.standardInput = inPipe;
+  if (outPipe) t.standardOutput = outPipe;
+  else if (quiet) t.standardOutput = NSFileHandle.fileHandleWithNullDevice;
+  if (quiet) t.standardError = NSFileHandle.fileHandleWithNullDevice;
+  if (![t launchAndReturnError:nil]) return 127;
+  if (inPipe) dispatch_async(dispatch_get_global_queue(0, 0), ^{
+    [inPipe.fileHandleForWriting writeData:input error:nil];
+    [inPipe.fileHandleForWriting closeAndReturnError:nil];
+  });
+  if (outPipe) *out = [outPipe.fileHandleForReading readDataToEndOfFile];
+  [t waitUntilExit];
+  return t.terminationStatus;
+}
+
+static NSDictionary *lastJSONLine(NSData *data) {
+  NSString *text = [[[NSString alloc] initWithData:data ?: NSData.data encoding:NSUTF8StringEncoding]
+                    stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+  NSString *last = [text componentsSeparatedByString:@"\n"].lastObject ?: @"";
+  id j = [NSJSONSerialization JSONObjectWithData:[last dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+  return [j isKindOfClass:NSDictionary.class] ? j : @{};
+}
+
+// screen-relay with --json right after the subcommand.
+static NSDictionary *srJSON(NSString *sr, NSArray *args, int *status) {
+  NSMutableArray *a = [args mutableCopy];
+  [a insertObject:@"--json" atIndex:1];
+  NSData *out = nil;
+  *status = runCmd(sr, a, nil, &out, NO);
+  return lastJSONLine(out);
+}
+
+static NSString *srName(NSString *name) {  // screen-relay session name for a display
+  NSString *safe = [pidPath(name).lastPathComponent stringByDeletingPathExtension].lowercaseString;
+  return [@"ad-" stringByAppendingString:[safe stringByReplacingOccurrencesOfString:@"_" withString:@"-"]];
+}
+
+static int freePort(NSString *name) {  // stable per name, so a bookmark keeps working
+  for (unsigned i = 0, h = fnv1a(name); i < 600; i++) {
+    int port = 18400 + (int)((h + i) % 600), fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    BOOL ok = bind(fd, (struct sockaddr *)&a, sizeof a) == 0;
+    close(fd);
+    if (ok) return port;
+  }
+  return 0;
+}
+
+// The viewer link carries the session token: keep it in a private file, print it only on request,
+// and hand it to the browser through LaunchServices, never through a command line.
+static int finishServe(NSString *name, NSString *host, NSString *url, NSString *link, BOOL open, BOOL showLink) {
+  NSString *p = statePath(host ? [NSString stringWithFormat:@"%@-%@", host, name] : name, @"link");
+  NSData *bytes = [[link stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+  [NSFileManager.defaultManager removeItemAtPath:p error:nil];
+  if (![NSFileManager.defaultManager createFileAtPath:p contents:bytes attributes:@{NSFilePosixPermissions: @0600}])
+    return fail(@"cannot write the link file", 1);
+  NSMutableDictionary *o = [@{@"name": name, @"url": url, @"linkFile": p} mutableCopy];
+  if (host) o[@"host"] = host;
+  if (showLink) o[@"link"] = link;
+  emit(o);
+  if (open) [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:link]];
+  return 0;
+}
+
+static int cmdUnserve(NSString *name) {
+  NSString *marker = statePath(name, @"serve");
+  NSArray *m = [[NSString stringWithContentsOfFile:marker encoding:NSUTF8StringEncoding error:nil] componentsSeparatedByString:@"\n"];
+  if (m.count < 2) { emit(@{@"name": name, @"unserved": @NO}); return 0; }
+  NSString *ts = findTool(@"tailscale"), *sr = findTool(@"screen-relay");
+  if (ts) runCmd(ts, @[@"serve", [@"--https=" stringByAppendingString:m[0]], @"off"], nil, NULL, YES);
+  if (sr) runCmd(sr, @[@"down", @"--name", m[1]], nil, NULL, YES);
+  // Drop the stopped session's state (logs, spent token). m[1] comes from srName(): [a-z0-9-] only.
+  NSString *state = NSProcessInfo.processInfo.environment[@"XDG_STATE_HOME"] ?: [NSHomeDirectory() stringByAppendingPathComponent:@".local/state"];
+  [NSFileManager.defaultManager removeItemAtPath:[NSString stringWithFormat:@"%@/screen-relay/%@", state, m[1]] error:nil];
+  [NSFileManager.defaultManager removeItemAtPath:marker error:nil];
+  [NSFileManager.defaultManager removeItemAtPath:statePath(name, @"link") error:nil];
+  emit(@{@"name": name, @"unserved": @YES});
+  return 0;
+}
+
+static int cmdServe(NSString *name, BOOL open, BOOL showLink) {
+  NSDictionary *d = displayNamed(name);
+  if (!d) return fail(@"no display with that name", 1);
+  NSString *sr = findTool(@"screen-relay"), *ts = findTool(@"tailscale");
+  if (!sr) return fail(@"screen-relay not found; run `npm install -g screen-relay && screen-relay install --yes`", 1);
+  if (!ts) return fail(@"tailscale not found", 1);
+  NSData *out = nil;
+  runCmd(ts, @[@"status", @"--json"], nil, &out, NO);
+  NSDictionary *st = [NSJSONSerialization JSONObjectWithData:out ?: NSData.data options:0 error:nil];
+  NSString *dns = [st isKindOfClass:NSDictionary.class] ? st[@"Self"][@"DNSName"] : nil;
+  if ([dns hasSuffix:@"."]) dns = [dns substringToIndex:dns.length - 1];
+  if (!dns.length) return fail(@"Tailscale is not connected", 1);
+
+  if ([NSFileManager.defaultManager fileExistsAtPath:statePath(name, @"serve")])
+    runCmd(gSelf, @[@"unserve", name], nil, NULL, YES);  // serve again = new session, new token
+  int port = freePort(name), status = 0;
+  if (!port) return fail(@"no free port between 18400 and 18999", 1);
+  NSString *session = srName(name), *portS = @(port).stringValue;
+  NSString *origin = [NSString stringWithFormat:@"https://%@:%d", dns, port];
+  NSDictionary *j = srJSON(sr, @[@"up", @"-d", @"--name", session, @"--port", portS, @"--output", [d[@"displayID"] stringValue],
+                                 @"--public", origin, @"--bind", @"127.0.0.1"], &status);
+  if (status) return fail(j[@"message"] ?: @"screen-relay up failed", 1);
+  [[NSString stringWithFormat:@"%@\n%@", portS, session] writeToFile:statePath(name, @"serve") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+  if (runCmd(ts, @[@"serve", @"--bg", [@"--https=" stringByAppendingString:portS], [@"http://127.0.0.1:" stringByAppendingString:portS]], nil, &out, NO) != 0) {
+    runCmd(gSelf, @[@"unserve", name], nil, NULL, YES);
+    return fail(@"tailscale serve failed", 1);
+  }
+  j = srJSON(sr, @[@"status", @"--name", session, @"--show-token"], &status);
+  NSString *token = j[@"session"][@"token"];
+  if (status || ![token isKindOfClass:NSString.class]) {
+    runCmd(gSelf, @[@"unserve", name], nil, NULL, YES);
+    return fail(@"screen-relay gave no token", 1);
+  }
+  return finishServe(name, nil, origin, [NSString stringWithFormat:@"%@/#token=%@", origin, token], open, showLink);
+}
+
+// ---------- --host (another machine over ssh) ----------
+// The host runs agent-display-linux.mjs from ~/.local/bin (see `setup`). Tailscale SSH needs no keys.
+
+static NSString *shq(NSString *s) {  // quote one argument for the remote shell
+  return [NSString stringWithFormat:@"'%@'", [s stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]];
+}
+
+static NSString *remoteCmd(NSArray<NSString *> *args) {
+  NSMutableArray *q = [NSMutableArray array];
+  for (NSString *a in args) [q addObject:shq(a)];
+  return [NSString stringWithFormat:@"$HOME/.local/bin/agent-display --expect-version %@ %@", kVersion, [q componentsJoinedByString:@" "]];
+}
+
+static int sshRun(NSString *host, NSString *command, NSData *input, NSData **out) {
+  // 120 s lets the user approve a Tailscale SSH check; its link goes to stderr.
+  NSMutableArray *a = [@[@"-o", @"BatchMode=yes", @"-o", @"ConnectTimeout=120"] mutableCopy];
+  if (!input) [a addObject:@"-n"];  // never read our stdin (it is the JSON-RPC stream under MCP)
+  [a addObjectsFromArray:@[@"--", host, command]];
+  return runCmd(@"/usr/bin/ssh", a, input, out, NO);
+}
+
+static int cmdRemote(NSString *host, NSArray<NSString *> *args) {
+  NSString *cmd = args[0], *name = args.count > 1 ? args[1] : nil;
+  NSData *out = nil;
+  int st;
+  BOOL shot = [cmd isEqualToString:@"shot"];
+  if (shot || [cmd isEqualToString:@"record"]) {  // the host sends the bytes; the file lands here
+    if (!name || (!shot && args.count < 3)) return fail(@"usage: agent-display record NAME PATH [--seconds N] --host HOST", 2);
+    NSString *path = args.count > 2 ? args[2] : [NSString stringWithFormat:@"%@/.cache/agent-display/%@-%@-%ld.png",
+                                                 NSHomeDirectory(), host, name, (long)NSDate.date.timeIntervalSince1970];
+    NSMutableArray *r = [@[cmd, name, @"-"] mutableCopy];
+    if (args.count > 3) [r addObjectsFromArray:[args subarrayWithRange:NSMakeRange(3, args.count - 3)]];
+    if ((st = sshRun(host, remoteCmd(r), nil, &out)) != 0) return st;
+    if (!out.length || ![out writeToFile:path atomically:YES]) return fail([@"cannot write " stringByAppendingString:path], 1);
+    emit(@{@"name": name, @"host": host, @"path": path});
+    return 0;
+  }
+  if ([cmd isEqualToString:@"serve"]) {
+    if (!name) return fail(@"usage: agent-display serve NAME [--open] --host HOST", 2);
+    if ((st = sshRun(host, remoteCmd(@[@"serve", name, @"--show-link"]), nil, &out)) != 0) return st;
+    NSDictionary *j = lastJSONLine(out);
+    if (![j[@"link"] isKindOfClass:NSString.class]) return fail(@"the host returned no viewer link", 1);
+    return finishServe(name, host, j[@"url"], j[@"link"], [args containsObject:@"--open"], [args containsObject:@"--show-link"]);
+  }
+  if ([cmd isEqualToString:@"run"]) {
+    // Become ssh: a signal to this process then reaches ssh, the connection drops, and the tty
+    // hangup makes the host remove the display.
+    const char *c = remoteCmd(args).UTF8String;
+    execl("/usr/bin/ssh", "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=120", "-tt", "--", host.UTF8String, c, (char *)NULL);
+    return fail(@"cannot start ssh", 127);
+  }
+  st = sshRun(host, remoteCmd(args), nil, NULL);
+  if (st == 127) fprintf(stderr, "agent-display: not installed on %s; run `agent-display setup %s`\n", host.UTF8String, host.UTF8String);
+  if (name && ([cmd isEqualToString:@"down"] || [cmd isEqualToString:@"unserve"]))
+    [NSFileManager.defaultManager removeItemAtPath:statePath([NSString stringWithFormat:@"%@-%@", host, name], @"link") error:nil];
+  return st;
+}
+
+// Copy the Linux script to a host and install screen-relay there. Run it again after an update.
+static int cmdSetup(NSString *host) {
+  NSString *mjs = [[gSelf.stringByResolvingSymlinksInPath stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"agent-display-linux.mjs"];
+  NSData *script = [NSData dataWithContentsOfFile:mjs];
+  if (!script) return fail([NSString stringWithFormat:@"%@ not found; keep it next to the agent-display binary", mjs], 1);
+  if (sshRun(host, @"mkdir -p ~/.local/bin ~/.cache/agent-display && cat > ~/.local/bin/agent-display && chmod +x ~/.local/bin/agent-display", script, NULL) != 0)
+    return fail(@"cannot copy agent-display to the host", 1);
+  NSString *sh = [NSString stringWithFormat:
+    @"export PATH=$HOME/.npm-global/bin:$HOME/.local/bin:$PATH\n"
+    @"command -v node >/dev/null || { echo 'agent-display: node 22 or newer is required on this host' >&2; exit 1; }\n"
+    @"command -v screen-relay >/dev/null || npm install -g screen-relay@%@ >&2 || exit 1\n"
+    @"screen-relay doctor 2>/dev/null | grep -q 'engine: ok' || screen-relay install --yes --desktop none >&2 || exit 1\n"
+    @"command -v ffmpeg >/dev/null || echo 'agent-display: ffmpeg is missing on this host; record will not work' >&2\n"
+    @"$HOME/.local/bin/agent-display version\n", kScreenRelay];
+  return sshRun(host, @"bash -s", [sh dataUsingEncoding:NSUTF8StringEncoding], NULL);
 }
 
 // ---------- main ----------
@@ -395,15 +659,40 @@ static int usage(void) {
     "  agent-display shot NAME [PATH]\n"
     "  agent-display record NAME PATH [--seconds N]\n"
     "  agent-display open NAME APP\n"
-    "  agent-display mcp\n");
+    "  agent-display serve NAME [--open] [--show-link]\n"
+    "  agent-display unserve NAME\n"
+    "  agent-display setup HOST\n"
+    "  agent-display mcp\n"
+    "Add --host HOST to run a display command on a host prepared with `setup`.\n");
   return 2;
 }
 
 int main(int argc, char **argv) {
   @autoreleasepool {
     gSelf = NSBundle.mainBundle.executablePath;  // absolute, even when started by a relative path
+    signal(SIGPIPE, SIG_IGN);
+
+    NSString *host = nil;  // --host HOST, anywhere before a `--`
+    for (int i = 1; i < argc - 1 && strcmp(argv[i], "--"); i++) {
+      if (strcmp(argv[i], "--host")) continue;
+      host = @(argv[i + 1]);
+      memmove(&argv[i], &argv[i + 2], (size_t)(argc - i - 1) * sizeof *argv);
+      argc -= 2;
+      break;
+    }
     if (argc < 2) return usage();
     NSString *cmd = @(argv[1]);
+    if ([cmd isEqualToString:@"setup"] && argc == 3) host = @(argv[2]);
+    // A host name goes to ssh, so allow only plain names: nothing that starts with `-`.
+    if (host && [host rangeOfString:@"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$" options:NSRegularExpressionSearch].location == NSNotFound)
+      return fail(@"HOST must be a plain host name", 2);
+    if ([cmd isEqualToString:@"setup"]) return argc == 3 ? cmdSetup(host) : usage();
+    if ([cmd isEqualToString:@"version"] && !host) { emit(@{@"version": kVersion, @"platform": @"macos"}); return 0; }
+    if (host && ![cmd isEqualToString:@"mcp"]) {
+      NSMutableArray *args = [NSMutableArray array];
+      for (int i = 1; i < argc; i++) [args addObject:@(argv[i])];
+      return cmdRemote(host, args);
+    }
     if ([cmd isEqualToString:@"list"]) { emit(allDisplays()); return 0; }
     if ([cmd isEqualToString:@"mcp"]) return cmdMcp();
     if (argc < 3) return usage();
@@ -427,6 +716,16 @@ int main(int argc, char **argv) {
       return cmdUp(name, w, h, hidpi, child);
     }
     if ([cmd isEqualToString:@"down"]) return cmdDown(name);
+    if ([cmd isEqualToString:@"unserve"]) return cmdUnserve(name);
+    if ([cmd isEqualToString:@"serve"]) {
+      BOOL open = NO, show = NO;
+      for (int i = 3; i < argc; i++) {
+        if (!strcmp(argv[i], "--open")) open = YES;
+        else if (!strcmp(argv[i], "--show-link")) show = YES;
+        else return usage();
+      }
+      return cmdServe(name, open, show);
+    }
     if ([cmd isEqualToString:@"shot"]) return cmdShot(name, argc > 3 ? @(argv[3]) : nil);
     if ([cmd isEqualToString:@"open"] && argc == 4) return cmdOpen(name, @(argv[3]));
     if ([cmd isEqualToString:@"record"] && argc >= 4) {

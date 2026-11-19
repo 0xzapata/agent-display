@@ -1,5 +1,6 @@
 #!/bin/bash
 # Self-check for agent-display. Run: ./test.sh   (creates and removes displays named ad-test-*)
+# Remote checks too: AD_TEST_HOST=my-vps ./test.sh
 set -u
 cd "$(dirname "$0")"
 B=./agent-display; out=$(mktemp -d "$HOME/.cache/agent-display-test.XXXX"); pass=0; failn=0
@@ -34,10 +35,56 @@ mcp=$( { printf '%s\n' \
  '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"display_screenshot","arguments":{"name":"ad-test-mcp"}}}' \
  '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"display_list","arguments":{}}}'; sleep 3; } | $B mcp )
 echo "$mcp" | grep -q '"serverInfo"' && ok "mcp initialize" || bad "mcp init"
-[ "$(echo "$mcp" | grep -o '"name":"display_[a-z_]*"' | sort -u | wc -l | tr -d ' ')" = 6 ] && ok "mcp lists 6 tools" || bad "mcp tools"
+[ "$(echo "$mcp" | grep -o '"name":"display_[a-z_]*"' | sort -u | wc -l | tr -d ' ')" = 8 ] && ok "mcp lists 8 tools" || bad "mcp tools"
 echo "$mcp" | grep '"id":4' | grep -q '"type":"image"' && ok "mcp screenshot returns image" || bad "mcp shot"
 echo "$mcp" | grep '"id":5' | grep -q 'ad-test-mcp' && ok "mcp display listed" || bad "mcp list"
+echo "$mcp" | grep '"id":5' | grep -q '"isError":false' && ok "mcp isError is a JSON boolean" || bad "mcp isError"
 sleep 1; ! has ad-test-mcp && ok "mcp disconnect removes display" || bad "mcp cleanup"
+
+
+# --- serve: needs screen-relay and Tailscale on this Mac ---
+if command -v tailscale >/dev/null && ls "$HOME"/.local/share/screen-relay/engine/*/relay-engine >/dev/null 2>&1; then
+  $B up ad-test-s --size 1280x800 > "$out/s.json" & spid=$!
+  for i in $(seq 1 100); do [ -s "$out/s.json" ] && break; sleep 0.1; done
+  $B serve ad-test-s > "$out/serve.json"; url=$(sed -E 's/.*"url":"([^"]+)".*/\1/' "$out/serve.json" | tr -d '\\')
+  lf="$HOME/.cache/agent-display/ad_test_s.link"
+  ! grep -q token "$out/serve.json" && [ "$(stat -f %Lp "$lf")" = 600 ] && ok "serve keeps the token in a 600 file" || bad "serve token"
+  [ "$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$url/")" = 200 ] && ok "viewer page loads over the tailnet" || bad "serve viewer ($url)"
+  [ "$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$url/screenshot.png")" = 401 ] && ok "no token gets 401" || bad "serve 401"
+  [ "$(curl -s -m 20 -o "$out/v.png" -w '%{http_code}' -H "Authorization: Bearer $(sed -E 's/.*#token=//' "$lf")" "$url/screenshot.png")" = 200 ] \
+    && [ "$(sips -g pixelWidth "$out/v.png" | awk '/pixelWidth/{print $2}')" = 1280 ] && ok "token gets the 1280 px display" || bad "serve token shot"
+  port=${url##*:}
+  kill $spid; wait $spid 2>/dev/null; sleep 1
+  ! tailscale serve status 2>/dev/null | grep -q ":$port " && [ ! -e "$lf" ] && ! lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 \
+    && [ ! -e "$HOME/.local/state/screen-relay/ad-ad-test-s" ] && ok "killing the display stops its viewer and removes its state" || bad "serve cleanup"
+else
+  echo "SKIP serve (screen-relay or tailscale not installed)"
+fi
+
+# --- --host: set AD_TEST_HOST to a host prepared with `agent-display setup HOST` ---
+if [ -n "${AD_TEST_HOST:-}" ]; then
+  H=$AD_TEST_HOST; R="--host $H"
+  $B up ad-test-r --size 1280x800 $R | grep -q '"width":1280' && ok "remote up" || bad "remote up"
+  $B list $R | grep -q '"name":"ad-test-r"' && ok "remote list" || bad "remote list"
+  $B open ad-test-r xmessage hello $R | grep -q '"pid":[0-9]' && ok "remote open" || bad "remote open"
+  $B shot ad-test-r "$out/r.png" $R >/dev/null && [ "$(sips -g pixelWidth "$out/r.png" | awk '/pixelWidth/{print $2}')" = 1280 ] && ok "remote shot lands here, 1280 px" || bad "remote shot"
+  $B record ad-test-r "$out/r.mp4" --seconds 2 $R >/dev/null && [ -s "$out/r.mp4" ] && ok "remote record lands here" || bad "remote record"
+  $B serve ad-test-r $R > "$out/rs.json"; rurl=$(sed -E 's/.*"url":"([^"]+)".*/\1/' "$out/rs.json" | tr -d '\\')
+  rlf="$HOME/.cache/agent-display/${H//[^A-Za-z0-9]/_}_ad_test_r.link"
+  ! grep -q token "$out/rs.json" && [ "$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$rurl/screenshot.png")" = 401 ] \
+    && [ "$(curl -s -m 20 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(sed -E 's/.*#token=//' "$rlf")" "$rurl/screenshot.png")" = 200 ] \
+    && ok "remote serve: 401 without token, 200 with" || bad "remote serve"
+  $B down ad-test-r $R | grep -q '"removed":true' && ! $B list $R | grep -q ad-test-r && [ ! -e "$rlf" ] && ok "remote down" || bad "remote down"
+  $B run ad-test-r2 $R -- bash -c '[ -n "$DISPLAY" ] && exit 7' 2>/dev/null; [ $? -eq 7 ] && ok "remote run passes DISPLAY + exit code" || bad "remote run"
+  ! $B list $R | grep -q ad-test-r2 && ok "remote run removes its display" || bad "remote run cleanup"
+  $B run ad-test-r3 $R -- sleep 60 2>/dev/null & kpid=$!
+  for i in $(seq 1 100); do $B list $R | grep -q ad-test-r3 && break; sleep 0.2; done
+  kill -TERM $kpid; wait $kpid 2>/dev/null; sleep 3
+  ! $B list $R | grep -q ad-test-r3 && ! pgrep -f 'ssh .*ad-test-r3' >/dev/null && ok "killing a remote run removes its display and ssh" || bad "remote run kill"
+  $B list --host '-oProxyCommand=x' 2>/dev/null; [ $? -eq 2 ] && ok "option-like host rejected" || bad "host validation"
+else
+  echo "SKIP --host (set AD_TEST_HOST=<host>)"
+fi
 
 rm -rf "$out" "$HOME"/.cache/agent-display/ad_test_mcp-*.png
 echo "$pass passed, $failn failed"; [ $failn -eq 0 ]

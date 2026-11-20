@@ -11,6 +11,8 @@
 //   agent-display shot NAME [PATH|-]               PNG; `-` writes the bytes to stdout
 //   agent-display record NAME PATH|- [--seconds N]
 //   agent-display open NAME APP [ARGS...]          start APP on the display
+//   agent-display click|move|scroll NAME X Y, drag NAME X1 Y1 X2 Y2, type NAME TEXT, key NAME COMBO...
+//                                                  input; X Y are pixels from the top left
 //   agent-display serve NAME [--show-link]         tailnet-only HTTPS viewer through Tailscale Serve
 //   agent-display unserve NAME
 //
@@ -21,7 +23,7 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, wr
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const HOME = homedir();
 const CACHE = join(HOME, '.cache/agent-display');
 const SR_STATE = join(process.env.XDG_STATE_HOME || join(HOME, '.local/state'), 'screen-relay');
@@ -37,10 +39,10 @@ function findTool(name) {
 const SR = findTool('screen-relay');
 
 // Run screen-relay with --json. Returns the parsed object, or null when it exits non-zero and `soft`.
-function sr(args, { soft = false, env } = {}) {
+function sr(args, { soft = false, env, input } = {}) {
   if (!SR) fail('screen-relay not found; run `npm install -g screen-relay && screen-relay install --yes --desktop none`');
   // --json goes right after the subcommand: after a `--` it would be part of the app's command.
-  const r = spawnSync(SR, [args[0], '--json', ...args.slice(1)], { encoding: 'utf8', env: env || process.env });
+  const r = spawnSync(SR, [args[0], '--json', ...args.slice(1)], { encoding: 'utf8', env: env || process.env, input });
   let j = null;
   for (const text of [r.stdout, r.stderr]) {  // results go to stdout, errors to stderr
     try { j = JSON.parse(text.trim().split('\n').pop()); break; } catch {}
@@ -156,6 +158,64 @@ if (cmd === 'list') {
   process.exit(0);
 }
 
+if (['ui', 'press', 'set'].includes(cmd))
+  fail(`${cmd} works on macOS only. A Linux display has its own pointer and keyboard: use click, type and key`, 2);
+if (['click', 'move', 'drag', 'scroll', 'type', 'key'].includes(cmd)) {
+  const name = checkName(argv.shift()), s = needSession(name);
+  const [w, h] = s.resolution.split('x').map(Number);
+  const text = cmd === 'type' || cmd === 'key', pos = [], opt = {};
+  let literal = false;  // after `--` every argument is data
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!literal && a === '--') literal = true;
+    else if (literal || text) pos.push(a);
+    else if (a === '--double') opt[a] = '1';
+    else if (['--button', '--dx', '--dy'].includes(a) && i + 1 < argv.length) opt[a] = argv[++i];
+    else pos.push(a);
+  }
+  const want = text ? 1 : cmd === 'drag' ? 4 : 2;
+  if (pos.length < want || (pos.length !== want && cmd !== 'key'))
+    fail('usage: click|move|scroll NAME X Y, drag NAME X1 Y1 X2 Y2, type NAME TEXT, key NAME COMBO...', 2);
+  // screen-relay takes fractions of the screen; aim at the middle of the pixel.
+  const pt = [];
+  if (!text) for (let i = 0; i < want; i += 2) {
+    const x = Number(pos[i]), y = Number(pos[i + 1]);
+    if (pos[i] === '' || pos[i + 1] === '' || !(x >= 0 && y >= 0 && x < w && y < h)) fail(`X Y must be inside the display: 0,0 to ${w - 1},${h - 1}`, 2);
+    pt.push({ x: (x + 0.5) / w, y: (y + 0.5) / h });
+  }
+  const send = (events) => sr(['input', '--name', name, '--stdin'], { input: JSON.stringify(events) });
+  if (cmd === 'type') {
+    if (!pos[0]) fail('TEXT must not be empty', 2);
+    sr(['type', '--name', name, '--stdin'], { input: pos[0] });
+    emit({ name, typed: pos[0].length });
+  } else if (cmd === 'key') {
+    // A combination goes to screen-relay as an argument, so it must not look like an option.
+    for (const c of pos) if (!/^[A-Za-z0-9]/.test(c) && c.length > 1) fail(`unknown key combination "${c}"; use e.g. ctrl+l, shift+tab, enter, f5`, 2);
+    sr(['key', '--name', name, ...pos]);
+    emit({ name, keys: pos });
+  } else {
+    if (cmd === 'move') send([{ type: 'pointerMove', ...pt[0] }]);
+    if (cmd === 'click') {
+      const button = { left: 1, middle: 2, right: 3 }[opt['--button'] || 'left'];
+      if (!button) fail('--button must be left, right or middle', 2);
+      const one = [{ type: 'buttonDown', button, ...pt[0] }, { type: 'buttonUp', button, ...pt[0] }];
+      send([{ type: 'pointerMove', ...pt[0] }, ...one, ...(opt['--double'] ? one : [])]);
+    }
+    if (cmd === 'drag') {
+      const steps = Array.from({ length: 10 }, (_, i) => ({ type: 'pointerMove', buttons: 1,
+        x: pt[0].x + (pt[1].x - pt[0].x) * (i + 1) / 10, y: pt[0].y + (pt[1].y - pt[0].y) * (i + 1) / 10 }));
+      send([{ type: 'pointerMove', ...pt[0] }, { type: 'buttonDown', button: 1, ...pt[0] }, ...steps, { type: 'buttonUp', button: 1, ...pt[1] }]);
+    }
+    if (cmd === 'scroll') {
+      const dx = Number(opt['--dx'] || 0), dy = Number(opt['--dy'] || 0);
+      if (!Number.isInteger(dx) || !Number.isInteger(dy) || (!dx && !dy) || Math.abs(dx) > 100 || Math.abs(dy) > 100) fail('scroll needs --dx N or --dy N, -100 to 100 notches', 2);
+      sr(['scroll', '--name', name, `--dx=${dx}`, `--dy=${dy}`, String(pt[0].x), String(pt[0].y)]);
+    }
+    emit({ name, action: cmd });
+  }
+  process.exit(0);
+}
+
 const dd = argv.indexOf('--');
 const child = dd >= 0 ? argv.splice(dd).slice(1) : null;
 const name = checkName(argv.shift());
@@ -213,5 +273,5 @@ if (cmd === 'up') {
 } else if (cmd === 'unserve') {
   emit({ name, unserved: unserve(name) });
 } else {
-  fail('usage: agent-display up|run|down|list|shot|record|open|serve|unserve|version ...', 2);
+  fail('usage: agent-display up|run|down|list|shot|record|open|click|move|drag|scroll|type|key|serve|unserve|version ...', 2);
 }

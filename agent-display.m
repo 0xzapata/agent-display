@@ -7,6 +7,15 @@
 //   agent-display shot NAME [PATH]                          PNG of that display only
 //   agent-display record NAME PATH [--seconds N]            .mov of that display only (default 10 s)
 //   agent-display open NAME APP                             launch APP, move its window onto NAME
+//   agent-display click NAME X Y [--button B] [--double]    input on that display; X Y are points from
+//   agent-display move NAME X Y                             its top left (= screenshot pixels at 1x)
+//   agent-display drag NAME X1 Y1 X2 Y2
+//   agent-display scroll NAME X Y [--dx N] [--dy N]         wheel notches; positive dy scrolls down
+//   agent-display type NAME TEXT
+//   agent-display key NAME COMBO...                         e.g. cmd+l enter
+//   agent-display ui NAME                                   macOS: controls on that display, as JSON
+//   agent-display press NAME ID [--action A]                macOS: press a control, pointer stays put
+//   agent-display set NAME ID TEXT                          macOS: set the value of a field
 //   agent-display serve NAME [--open] [--show-link]         tailnet-only browser viewer (needs screen-relay)
 //   agent-display unserve NAME                              stop the viewer
 //   agent-display setup HOST                                install on a Linux host over ssh
@@ -25,7 +34,7 @@
 #import <sys/socket.h>
 #import <netinet/in.h>
 
-static NSString *const kVersion = @"0.2.0";      // must match VERSION in agent-display-linux.mjs
+static NSString *const kVersion = @"0.3.0";      // must match VERSION in agent-display-linux.mjs
 static NSString *const kScreenRelay = @"0.1.2";  // the screen-relay version that `setup` installs
 
 @interface CGVirtualDisplayDescriptor : NSObject
@@ -295,6 +304,281 @@ static int cmdOpen(NSString *name, NSString *app) {
   return 0;
 }
 
+// ---------- input (computer use) ----------
+// ponytail: events go through the one system pointer and keyboard (CGEventPost), so they move the
+// user's pointer and go to the focused app. macOS has no per-display input; a Linux host has.
+// Upgrade path: per-app delivery with CGEventPostToPid when background input is needed.
+
+static const char *kKeys[] = {  // index = macOS virtual key code
+  "a","s","d","f","h","g","z","x","c","v","","b","q","w","e","r","y","t","1","2","3","4","6","5","=","9","7","-","8","0",
+  "]","o","u","[","i","p","enter","l","j","'","k",";","\\",",","/","n","m",".","tab","space","`","backspace","","escape",
+  "","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","",
+  "f5","f6","f7","f3","f8","f9","","f11","","","","","","f10","","f12","","","","home","pageup","delete","f4","end","f2",
+  "pagedown","f1","left","right","down","up"};
+
+static void postMouse(CGEventType type, CGPoint p, CGMouseButton b, int clicks) {
+  CGEventRef e = CGEventCreateMouseEvent(NULL, type, p, b);
+  if (clicks) CGEventSetIntegerValueField(e, kCGMouseEventClickState, clicks);
+  CGEventPost(kCGHIDEventTap, e);
+  CFRelease(e);
+  usleep(20000);  // apps drop events that arrive in the same instant
+}
+
+static BOOL postCombo(NSString *combo) {
+  CGEventFlags flags = 0;
+  int code = -1;
+  for (NSString *part in [combo.lowercaseString componentsSeparatedByString:@"+"]) {
+    if ([@[@"cmd", @"command", @"super", @"meta"] containsObject:part]) flags |= kCGEventFlagMaskCommand;
+    else if ([@[@"ctrl", @"control"] containsObject:part]) flags |= kCGEventFlagMaskControl;
+    else if ([@[@"alt", @"option", @"opt"] containsObject:part]) flags |= kCGEventFlagMaskAlternate;
+    else if ([part isEqualToString:@"shift"]) flags |= kCGEventFlagMaskShift;
+    else {
+      NSString *k = [@{@"return": @"enter", @"esc": @"escape"} objectForKey:part] ?: part;
+      if (code >= 0 || !k.length) return NO;  // one key for each combo
+      for (int i = 0; i < (int)(sizeof kKeys / sizeof *kKeys); i++) if (!strcmp(kKeys[i], k.UTF8String)) code = i;
+      if (code < 0) return NO;
+    }
+  }
+  if (code < 0) return NO;
+  for (int down = 1; down >= 0; down--) {
+    CGEventRef e = CGEventCreateKeyboardEvent(NULL, (CGKeyCode)code, down);
+    CGEventSetFlags(e, flags);
+    CGEventPost(kCGHIDEventTap, e);
+    CFRelease(e);
+    usleep(20000);
+  }
+  return YES;
+}
+
+// argv: the arguments after NAME.
+static int cmdInput(NSString *cmd, NSString *name, NSArray<NSString *> *argv) {
+  NSDictionary *d = displayNamed(name);
+  if (!d) return fail(@"no display with that name", 1);
+  if (!AXIsProcessTrusted()) return fail(@"this terminal needs Accessibility permission (System Settings > Privacy & Security)", 1);
+  CGRect b = boundsOf(d);
+  NSMutableArray<NSString *> *pos = [NSMutableArray array];
+  NSMutableDictionary<NSString *, NSString *> *opt = [NSMutableDictionary dictionary];
+  BOOL text = [cmd isEqualToString:@"type"] || [cmd isEqualToString:@"key"];
+  BOOL literal = NO;  // after `--` every argument is data
+  for (NSUInteger i = 0; i < argv.count; i++) {
+    NSString *a = argv[i];
+    if (!literal && [a isEqualToString:@"--"]) literal = YES;
+    else if (literal || text) [pos addObject:a];
+    else if ([a isEqualToString:@"--double"]) opt[a] = @"1";
+    else if ([@[@"--button", @"--dx", @"--dy"] containsObject:a] && i + 1 < argv.count) opt[a] = argv[++i];
+    else [pos addObject:a];
+  }
+  NSUInteger want = text ? 1 : [cmd isEqualToString:@"drag"] ? 4 : 2;
+  if (pos.count < want || (pos.count != want && ![cmd isEqualToString:@"key"]))
+    return fail(@"usage: click|move|scroll NAME X Y, drag NAME X1 Y1 X2 Y2, type NAME TEXT, key NAME COMBO...", 2);
+
+  CGPoint pt[2] = {CGPointZero, CGPointZero};
+  if (!text) for (NSUInteger i = 0; i < want; i += 2) {
+    char *e1, *e2;
+    double x = strtod(pos[i].UTF8String, &e1), y = strtod(pos[i + 1].UTF8String, &e2);
+    if (*e1 || *e2 || !pos[i].length || !pos[i + 1].length || !(x >= 0 && y >= 0 && x < b.size.width && y < b.size.height))
+      return fail([NSString stringWithFormat:@"X Y must be inside the display: 0,0 to %d,%d", (int)b.size.width - 1, (int)b.size.height - 1], 2);
+    pt[i / 2] = CGPointMake(b.origin.x + x, b.origin.y + y);
+  }
+
+  if ([cmd isEqualToString:@"type"]) {
+    NSString *t = pos[0];
+    if (!t.length) return fail(@"TEXT must not be empty", 2);
+    for (NSUInteger i = 0; i < t.length;) {  // one composed character for each event pair
+      NSRange r = [t rangeOfComposedCharacterSequenceAtIndex:i];
+      unichar buf[r.length];
+      [t getCharacters:buf range:r];
+      if (r.length == 1 && (buf[0] == '\n' || buf[0] == '\t')) postCombo(buf[0] == '\n' ? @"enter" : @"tab");
+      else for (int down = 1; down >= 0; down--) {
+        CGEventRef e = CGEventCreateKeyboardEvent(NULL, 0, down);
+        CGEventSetFlags(e, 0);
+        CGEventKeyboardSetUnicodeString(e, r.length, buf);
+        CGEventPost(kCGHIDEventTap, e);
+        CFRelease(e);
+        usleep(4000);
+      }
+      i = NSMaxRange(r);
+    }
+    emit(@{@"name": name, @"typed": @(t.length)});
+    return 0;
+  }
+  if ([cmd isEqualToString:@"key"]) {
+    for (NSString *c in pos) if (!postCombo(c)) return fail([NSString stringWithFormat:@"unknown key combination \"%@\"; use e.g. cmd+l, shift+tab, enter, f5", c], 2);
+    emit(@{@"name": name, @"keys": pos});
+    return 0;
+  }
+
+  postMouse(kCGEventMouseMoved, pt[0], kCGMouseButtonLeft, 0);
+  if ([cmd isEqualToString:@"click"]) {
+    NSString *bn = opt[@"--button"] ?: @"left";
+    NSUInteger bi = [@[@"left", @"right", @"middle"] indexOfObject:bn];
+    if (bi == NSNotFound) return fail(@"--button must be left, right or middle", 2);
+    CGEventType dn[] = {kCGEventLeftMouseDown, kCGEventRightMouseDown, kCGEventOtherMouseDown};
+    CGEventType up[] = {kCGEventLeftMouseUp, kCGEventRightMouseUp, kCGEventOtherMouseUp};
+    for (int n = 1; n <= (opt[@"--double"] ? 2 : 1); n++) {
+      postMouse(dn[bi], pt[0], (CGMouseButton)bi, n);
+      postMouse(up[bi], pt[0], (CGMouseButton)bi, n);
+    }
+  } else if ([cmd isEqualToString:@"drag"]) {
+    postMouse(kCGEventLeftMouseDown, pt[0], kCGMouseButtonLeft, 1);
+    for (int i = 1; i <= 10; i++)  // apps start a drag only after they see movement
+      postMouse(kCGEventLeftMouseDragged, CGPointMake(pt[0].x + (pt[1].x - pt[0].x) * i / 10, pt[0].y + (pt[1].y - pt[0].y) * i / 10), kCGMouseButtonLeft, 1);
+    postMouse(kCGEventLeftMouseUp, pt[1], kCGMouseButtonLeft, 1);
+  } else if ([cmd isEqualToString:@"scroll"]) {
+    int dx = opt[@"--dx"].intValue, dy = opt[@"--dy"].intValue;
+    if ((!dx && !dy) || abs(dx) > 100 || abs(dy) > 100) return fail(@"scroll needs --dx N or --dy N, -100 to 100 notches", 2);
+    CGEventRef e = CGEventCreateScrollWheelEvent(NULL, kCGScrollEventUnitLine, 2, -dy, -dx);  // CG: positive is up/left
+    CGEventPost(kCGHIDEventTap, e);
+    CFRelease(e);
+  }
+  usleep(30000);
+  CGEventRef now = CGEventCreate(NULL);  // read the pointer back: proof of where the event landed
+  CGPoint at = CGEventGetLocation(now);
+  CFRelease(now);
+  emit(@{@"name": name, @"action": cmd, @"pointer": @{@"x": @(at.x - b.origin.x), @"y": @(at.y - b.origin.y)}});
+  return 0;
+}
+
+// ---------- ui (accessibility: act on a control, the pointer stays where it is) ----------
+// An ID is PID:WINDOW.CHILD.CHILD..., a path of child indexes in the accessibility tree.
+// ponytail: an ID is a position, not an identity. It goes stale when the app changes its windows
+// or its layout, so callers run `ui` again after each action. press and set print the role and
+// label of the control they acted on. Upgrade path: match on role and label when the path moved.
+// ponytail: windows only, no menu bar (use `key`), max 400 controls for each call.
+
+static id axGet(AXUIElementRef e, NSString *attr) {
+  CFTypeRef v = NULL;
+  return AXUIElementCopyAttributeValue(e, (__bridge CFStringRef)attr, &v) == kAXErrorSuccess ? CFBridgingRelease(v) : nil;
+}
+
+static BOOL axFrame(AXUIElementRef e, CGRect *r) {
+  id p = axGet(e, @"AXPosition"), s = axGet(e, @"AXSize");
+  return p && s && CFGetTypeID((__bridge CFTypeRef)p) == AXValueGetTypeID() && CFGetTypeID((__bridge CFTypeRef)s) == AXValueGetTypeID()
+      && AXValueGetValue((__bridge AXValueRef)p, kAXValueTypeCGPoint, &r->origin) && AXValueGetValue((__bridge AXValueRef)s, kAXValueTypeCGSize, &r->size);
+}
+
+static BOOL axOn(AXUIElementRef e, CGRect b) {  // is the centre of this element on the display?
+  CGRect f;
+  return axFrame(e, &f) && CGRectContainsPoint(b, CGPointMake(CGRectGetMidX(f), CGRectGetMidY(f)));
+}
+
+static NSArray *axWindows(pid_t pid) {
+  AXUIElementRef app = AXUIElementCreateApplication(pid);
+  AXUIElementSetAttributeValue(app, CFSTR("AXManualAccessibility"), kCFBooleanTrue);  // Electron builds its tree on request
+  NSArray *w = axGet(app, @"AXWindows");
+  CFRelease(app);
+  return [w isKindOfClass:NSArray.class] ? w : @[];
+}
+
+static NSString *axText(id v) {
+  NSString *s = [v isKindOfClass:NSString.class] ? v : [v isKindOfClass:NSNumber.class] ? [v stringValue] : nil;
+  return s.length > 200 ? [[s substringToIndex:200] stringByAppendingString:@"…"] : s;
+}
+
+static NSDictionary *axInfo(AXUIElementRef e, CGRect b) {
+  NSMutableDictionary *m = [NSMutableDictionary dictionary];
+  m[@"role"] = axText(axGet(e, @"AXRole")) ?: @"";
+  NSString *label = axText(axGet(e, @"AXTitle"));
+  if (!label.length) label = axText(axGet(e, @"AXDescription"));
+  if (label.length) m[@"label"] = label;
+  NSString *value = axText(axGet(e, @"AXValue"));
+  if (value) m[@"value"] = value;
+  CGRect f;
+  if (axFrame(e, &f)) m[@"frame"] = rectDict(CGRectOffset(f, -b.origin.x, -b.origin.y));
+  return m;
+}
+
+static void axWalk(AXUIElementRef e, NSString *path, CGRect b, int depth, NSMutableArray *out, int *visited) {
+  if (depth > 40 || ++*visited > 5000 || out.count >= 400) return;
+  CFArrayRef names = NULL;
+  AXUIElementCopyActionNames(e, &names);
+  NSArray *all = CFBridgingRelease(names) ?: @[];
+  NSMutableArray *acts = [NSMutableArray array];
+  for (NSString *a in @[@"AXPress", @"AXIncrement", @"AXDecrement", @"AXConfirm", @"AXCancel", @"AXPick", @"AXOpen"])
+    if ([all containsObject:a]) [acts addObject:a];
+  Boolean settable = false;
+  AXUIElementIsAttributeSettable(e, kAXValueAttribute, &settable);
+  NSMutableDictionary *m = [axInfo(e, b) mutableCopy];
+  BOOL text = [m[@"role"] isEqualToString:@"AXStaticText"] && [m[@"value"] length];
+  if ((acts.count || settable || text) && axOn(e, b)) {
+    m[@"id"] = path;
+    if (acts.count) m[@"actions"] = acts;
+    if (settable) m[@"settable"] = @YES;
+    [out addObject:m];
+  }
+  NSArray *kids = axGet(e, @"AXChildren");
+  if (![kids isKindOfClass:NSArray.class]) return;
+  for (NSUInteger i = 0; i < kids.count; i++)
+    axWalk((__bridge AXUIElementRef)kids[i], [path stringByAppendingFormat:@".%lu", (unsigned long)i], b, depth + 1, out, visited);
+}
+
+// argv: the arguments after NAME.
+static int cmdUi(NSString *cmd, NSString *name, NSArray<NSString *> *argv) {
+  NSDictionary *d = displayNamed(name);
+  if (!d) return fail(@"no display with that name", 1);
+  if (!AXIsProcessTrusted()) return fail(@"this terminal needs Accessibility permission (System Settings > Privacy & Security)", 1);
+  CGRect b = boundsOf(d);
+  AXUIElementRef sys = AXUIElementCreateSystemWide();
+  AXUIElementSetMessagingTimeout(sys, 2);  // for all elements: an app that hangs must not hang us
+  CFRelease(sys);
+
+  if ([cmd isEqualToString:@"ui"]) {
+    if (argv.count) return fail(@"usage: ui NAME", 2);
+    NSMutableArray *wins = [NSMutableArray array], *out = [NSMutableArray array];
+    int visited = 0;
+    for (NSRunningApplication *ra in NSWorkspace.sharedWorkspace.runningApplications) {
+      if (ra.activationPolicy != NSApplicationActivationPolicyRegular) continue;
+      NSArray *ws = axWindows(ra.processIdentifier);
+      for (NSUInteger i = 0; i < ws.count; i++) {
+        AXUIElementRef w = (__bridge AXUIElementRef)ws[i];
+        if (!axOn(w, b)) continue;
+        NSString *wid = [NSString stringWithFormat:@"%d:%lu", ra.processIdentifier, (unsigned long)i];
+        [wins addObject:@{@"id": wid, @"app": ra.localizedName ?: @"", @"title": axText(axGet(w, @"AXTitle")) ?: @""}];
+        axWalk(w, wid, b, 0, out, &visited);
+      }
+    }
+    emit(@{@"name": name, @"windows": wins, @"elements": out, @"truncated": out.count >= 400 || visited > 5000 ? @YES : @NO});
+    return 0;
+  }
+
+  BOOL set = [cmd isEqualToString:@"set"];
+  NSString *ident = argv.count ? argv[0] : @"", *action = @"AXPress", *text = nil;
+  NSArray *rest = argv.count ? [argv subarrayWithRange:NSMakeRange(1, argv.count - 1)] : @[];
+  if (set) {
+    if (rest.count == 2 && [rest[0] isEqualToString:@"--"]) text = rest[1];
+    else if (rest.count == 1) text = rest[0];
+  } else if (rest.count == 2 && [rest[0] isEqualToString:@"--action"]) action = rest[1];
+  if ((set && !text) || (!set && rest.count && rest.count != 2) || (!set && rest.count && ![rest[0] isEqualToString:@"--action"]))
+    return fail(@"usage: press NAME ID [--action A], set NAME ID TEXT", 2);
+  if ([ident rangeOfString:@"^[0-9]{1,9}:[0-9]{1,4}(\\.[0-9]{1,5}){0,40}$" options:NSRegularExpressionSearch].location == NSNotFound)
+    return fail(@"ID must come from `ui`, e.g. 4242:0.3.1", 2);
+
+  NSArray<NSString *> *head = [[ident componentsSeparatedByString:@"."][0] componentsSeparatedByString:@":"];
+  NSArray<NSString *> *path = [ident componentsSeparatedByString:@"."];
+  NSArray *ws = axWindows(head[0].intValue);
+  NSString *stale = @"no control with that ID on this display; run `ui` again";
+  if ((NSUInteger)head[1].integerValue >= ws.count) return fail(stale, 1);
+  id el = ws[head[1].integerValue];
+  if (!axOn((__bridge AXUIElementRef)el, b)) return fail(stale, 1);  // never act on a window of another display
+  for (NSUInteger i = 1; i < path.count; i++) {
+    NSArray *kids = axGet((__bridge AXUIElementRef)el, @"AXChildren");
+    if (![kids isKindOfClass:NSArray.class] || (NSUInteger)path[i].integerValue >= kids.count) return fail(stale, 1);
+    el = kids[path[i].integerValue];
+  }
+  AXUIElementRef e = (__bridge AXUIElementRef)el;
+  AXError err = set ? AXUIElementSetAttributeValue(e, kAXValueAttribute, (__bridge CFTypeRef)text)
+                    : AXUIElementPerformAction(e, (__bridge CFStringRef)action);
+  if (err == kAXErrorCannotComplete)
+    return fail(@"the app did not answer in 2 s. The action can have happened: look at the display before you repeat it", 1);
+  if (err != kAXErrorSuccess)
+    return fail([NSString stringWithFormat:@"this control does not support %@ (AXError %d)", set ? @"a new value" : action, (int)err], 1);
+  NSMutableDictionary *m = [axInfo(e, b) mutableCopy];
+  m[@"name"] = name; m[@"id"] = ident;
+  if (!set) m[@"action"] = action;
+  emit(m);
+  return 0;
+}
+
 // ---------- mcp ----------
 // Each tool call runs this binary as a subprocess (fresh display list). Displays created over MCP
 // are removed when the MCP client disconnects, so a finished agent session leaves nothing behind.
@@ -325,6 +609,7 @@ static NSDictionary *tool(NSString *name, NSString *desc, NSDictionary *props, N
 static NSArray *mcpTools(void) {
   NSDictionary *str = @{@"type": @"string"};
   NSDictionary *nameP = @{@"type": @"string", @"description": @"Display name, e.g. agent-1"};
+  NSDictionary *num = @{@"type": @"number"};
   return @[
     tool(@"display_create", @"Create a named virtual display for this session. It is removed when the session ends.",
          @{@"name": nameP, @"size": @{@"type": @"string", @"description": @"WIDTHxHEIGHT in points, default 1440x900"},
@@ -336,6 +621,23 @@ static NSArray *mcpTools(void) {
          @{@"name": nameP, @"path": str, @"seconds": @{@"type": @"integer", @"description": @"default 10, max 600"}}, @[@"name", @"path"]),
     tool(@"display_open_app", @"Launch an app (or bring it forward) and move its first window onto the display.",
          @{@"name": nameP, @"app": @{@"type": @"string", @"description": @"App name, e.g. Google Chrome. On a Linux host: a command, e.g. chromium"}}, @[@"name", @"app"]),
+    tool(@"display_click", @"Click on a display. x and y are pixels of its 1x screenshot, from the top left. On macOS this moves the user's pointer.",
+         @{@"name": nameP, @"x": num, @"y": num, @"button": @{@"type": @"string", @"enum": @[@"left", @"right", @"middle"]}, @"double": @{@"type": @"boolean"}}, @[@"name", @"x", @"y"]),
+    tool(@"display_move", @"Move the pointer to a point on a display.", @{@"name": nameP, @"x": num, @"y": num}, @[@"name", @"x", @"y"]),
+    tool(@"display_drag", @"Press the left button at x,y, move to x2,y2, release.",
+         @{@"name": nameP, @"x": num, @"y": num, @"x2": num, @"y2": num}, @[@"name", @"x", @"y", @"x2", @"y2"]),
+    tool(@"display_scroll", @"Scroll at a point on a display. dy and dx are wheel notches; positive dy scrolls down.",
+         @{@"name": nameP, @"x": num, @"y": num, @"dx": @{@"type": @"integer"}, @"dy": @{@"type": @"integer"}}, @[@"name", @"x", @"y"]),
+    tool(@"display_type", @"Type text into the focused app. Click the target field first. On macOS the text goes to whatever has keyboard focus.",
+         @{@"name": nameP, @"text": str}, @[@"name", @"text"]),
+    tool(@"display_key", @"Press key combinations in order, e.g. [\"cmd+l\", \"enter\"]. Modifiers: cmd, ctrl, alt, shift.",
+         @{@"name": nameP, @"keys": @{@"type": @"array", @"items": str}}, @[@"name", @"keys"]),
+    tool(@"display_ui", @"macOS only. List the controls in the windows on a display: id, role, label, value, frame, actions. Use it to act without the user's pointer. Run it again after each action: an id is a position and goes stale.",
+         @{@"name": nameP}, @[@"name"]),
+    tool(@"display_press", @"macOS only. Press a control from display_ui by id. The user's pointer does not move and the app does not need focus.",
+         @{@"name": nameP, @"id": str, @"action": @{@"type": @"string", @"description": @"Default AXPress. One of the actions that display_ui lists"}}, @[@"name", @"id"]),
+    tool(@"display_set", @"macOS only. Set the value of a settable control from display_ui, e.g. the text of a field. No pointer, no keyboard focus.",
+         @{@"name": nameP, @"id": str, @"text": str}, @[@"name", @"id", @"text"]),
     tool(@"display_serve", @"Start a browser viewer for the display, reachable only from the user's own Tailscale devices. Returns the URL and the path of a private file that holds the full link with its access token. Never print the token.",
          @{@"name": nameP, @"open": @{@"type": @"boolean", @"description": @"Open the viewer in the user's browser on this Mac"}}, @[@"name"]),
     tool(@"display_unserve", @"Stop the browser viewer of a display.", @{@"name": nameP}, @[@"name"]),
@@ -350,6 +652,36 @@ static NSDictionary *mcpCall(NSString *tname, NSDictionary *a) {
   NSArray *(^at)(NSArray *) = ^(NSArray *args) { return host ? [args arrayByAddingObjectsFromArray:@[@"--host", host]] : args; };
 
   if ([tname isEqualToString:@"display_list"]) return callSelf(at(@[@"list"]));
+  if ([@[@"display_click", @"display_move", @"display_drag", @"display_scroll", @"display_type", @"display_key"] containsObject:tname]) {
+    // `--` ends option parsing in the child, so text or keys that look like options stay data.
+    NSMutableArray *args = [@[[tname substringFromIndex:8], name] mutableCopy];
+    NSString *(^n)(NSString *) = ^(NSString *k) { return [a[k] isKindOfClass:NSNumber.class] ? [a[k] stringValue] : @""; };
+    if ([tname isEqualToString:@"display_type"]) [args addObjectsFromArray:@[@"--", [a[@"text"] isKindOfClass:NSString.class] ? a[@"text"] : @""]];
+    else if ([tname isEqualToString:@"display_key"]) {
+      [args addObject:@"--"];
+      for (id k in ([a[@"keys"] isKindOfClass:NSArray.class] ? a[@"keys"] : @[])) if ([k isKindOfClass:NSString.class]) [args addObject:k];
+    } else {
+      if ([a[@"button"] isKindOfClass:NSString.class]) [args addObjectsFromArray:@[@"--button", a[@"button"]]];
+      if ([a[@"double"] boolValue]) [args addObject:@"--double"];
+      if (a[@"dx"]) [args addObjectsFromArray:@[@"--dx", n(@"dx")]];
+      if (a[@"dy"]) [args addObjectsFromArray:@[@"--dy", n(@"dy")]];
+      [args addObjectsFromArray:@[@"--", n(@"x"), n(@"y")]];
+      if ([tname isEqualToString:@"display_drag"]) [args addObjectsFromArray:@[n(@"x2"), n(@"y2")]];
+    }
+    return callSelf(host ? [@[args[0], args[1], @"--host", host] arrayByAddingObjectsFromArray:[args subarrayWithRange:NSMakeRange(2, args.count - 2)]] : args);
+  }
+  if ([tname isEqualToString:@"display_ui"]) return callSelf(at(@[@"ui", name]));
+  if ([tname isEqualToString:@"display_press"] || [tname isEqualToString:@"display_set"]) {
+    NSString *(^sv)(NSString *) = ^(NSString *k) { return [a[k] isKindOfClass:NSString.class] ? (NSString *)a[k] : @""; };
+    NSMutableArray *args = [@[[tname substringFromIndex:8], name] mutableCopy];
+    if (host) [args addObjectsFromArray:@[@"--host", host]];  // before `--`, or it is data
+    [args addObject:sv(@"id")];
+    if ([tname isEqualToString:@"display_set"]) {
+      if (![a[@"text"] isKindOfClass:NSString.class]) return @{@"ok": @NO, @"text": @"text is required"};
+      [args addObjectsFromArray:@[@"--", sv(@"text")]];
+    } else if ([a[@"action"] isKindOfClass:NSString.class]) [args addObjectsFromArray:@[@"--action", sv(@"action")]];
+    return callSelf(args);
+  }
   if ([tname isEqualToString:@"display_serve"]) return callSelf(at([a[@"open"] boolValue] ? @[@"serve", name, @"--open"] : @[@"serve", name]));
   if ([tname isEqualToString:@"display_unserve"]) return callSelf(at(@[@"unserve", name]));
   if (host && [tname isEqualToString:@"display_remove"]) {
@@ -405,7 +737,7 @@ static int cmdMcp(void) {
       id result = nil;
       if ([method isEqualToString:@"initialize"])
         result = @{@"protocolVersion": req[@"params"][@"protocolVersion"] ?: @"2025-06-18",
-                   @"capabilities": @{@"tools": @{}}, @"serverInfo": @{@"name": @"agent-display", @"version": @"0.1.0"}};
+                   @"capabilities": @{@"tools": @{}}, @"serverInfo": @{@"name": @"agent-display", @"version": kVersion}};
       else if ([method isEqualToString:@"tools/list"]) result = @{@"tools": mcpTools()};
       else if ([method isEqualToString:@"ping"]) result = @{};
       else if ([method isEqualToString:@"tools/call"]) {
@@ -659,6 +991,15 @@ static int usage(void) {
     "  agent-display shot NAME [PATH]\n"
     "  agent-display record NAME PATH [--seconds N]\n"
     "  agent-display open NAME APP\n"
+    "  agent-display click NAME X Y [--button left|right|middle] [--double]\n"
+    "  agent-display move NAME X Y\n"
+    "  agent-display drag NAME X1 Y1 X2 Y2\n"
+    "  agent-display scroll NAME X Y [--dx N] [--dy N]\n"
+    "  agent-display type NAME TEXT\n"
+    "  agent-display key NAME COMBO...\n"
+    "  agent-display ui NAME\n"
+    "  agent-display press NAME ID [--action A]\n"
+    "  agent-display set NAME ID TEXT\n"
     "  agent-display serve NAME [--open] [--show-link]\n"
     "  agent-display unserve NAME\n"
     "  agent-display setup HOST\n"
@@ -714,6 +1055,16 @@ int main(int argc, char **argv) {
       if ([cmd isEqualToString:@"run"] && !child) return usage();
       if ([cmd isEqualToString:@"up"] && child) return usage();
       return cmdUp(name, w, h, hidpi, child);
+    }
+    if ([@[@"click", @"move", @"drag", @"scroll", @"type", @"key"] containsObject:cmd]) {
+      NSMutableArray *rest = [NSMutableArray array];
+      for (int i = 3; i < argc; i++) [rest addObject:@(argv[i])];
+      return cmdInput(cmd, name, rest);
+    }
+    if ([@[@"ui", @"press", @"set"] containsObject:cmd]) {
+      NSMutableArray *rest = [NSMutableArray array];
+      for (int i = 3; i < argc; i++) [rest addObject:@(argv[i])];
+      return cmdUi(cmd, name, rest);
     }
     if ([cmd isEqualToString:@"down"]) return cmdDown(name);
     if ([cmd isEqualToString:@"unserve"]) return cmdUnserve(name);

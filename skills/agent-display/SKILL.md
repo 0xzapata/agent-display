@@ -1,6 +1,6 @@
 ---
 name: agent-display
-description: Give an agent its own macOS virtual display for computer-use, browser, simulator, or UI test work, so the user's screen stays free. Use when a task needs a separate screen, a screenshot or recording of only the agent's screen, or an app moved off the user's display. Uses the agent-display CLI or its MCP tools (display_create, display_screenshot, ...).
+description: Give an agent its own macOS virtual display for computer-use, browser, simulator, or UI test work, so the user's screen stays free. Use when a task needs a separate screen, a screenshot or recording of only the agent's screen, or an app moved off the user's display. Also drives that display for computer use: click, type, key, scroll, drag. Uses the agent-display CLI or its MCP tools (display_create, display_screenshot, display_click, display_ui, display_press, ...).
 ---
 
 # agent-display
@@ -28,6 +28,29 @@ description: Give an agent its own macOS virtual display for computer-use, brows
    and from MCP remove themselves.
 
 All CLI commands print one JSON line on success and exit non-zero with a message on stderr on failure.
+
+## Computer use: look, then act
+
+1. Look: `display_screenshot` / `agent-display shot NAME`.
+2. Act with coordinates from that screenshot (pixels from its top left, at the default 1x):
+   - `display_click {"name", "x", "y"}` / `agent-display click NAME X Y [--button right] [--double]`
+   - `display_type {"name", "text"}` / `agent-display type NAME TEXT`. Click the field first.
+   - `display_key {"name", "keys": ["cmd+l", "enter"]}` / `agent-display key NAME cmd+l enter`
+   - `display_scroll` (positive `dy` scrolls down), `display_drag`, `display_move`.
+3. Look again to confirm the result. Do not chain many actions without a screenshot.
+
+- On a `--hidpi` display, divide screenshot pixels by 2.
+- In the CLI, put `--` before text that starts with a dash.
+- On macOS, try the accessibility commands first. They do not move the user's pointer:
+  1. `display_ui {"name"}` / `agent-display ui NAME` lists controls with `id`, `role`, `label`, `value`, `actions`.
+  2. `display_press {"name", "id"}` / `agent-display press NAME ID` presses one.
+  3. `display_set {"name", "id", "text"}` / `agent-display set NAME ID TEXT` writes a field marked `settable`.
+  4. Run `ui` again after each action. An ID is a position and goes stale. Check the role and label that `press` and `set` print.
+  Fall back to `click` and `type` when `ui` does not list the control.
+- On macOS each `click`/`type`/`key` action moves the user's pointer, and `type`/`key` go to the focused app. Tell the
+  user before you start, keep the run short, and prefer a Linux `host` for long runs.
+- Use these for apps without a better interface. For a web page, Playwright or the Chrome DevTools
+  Protocol is faster and does not move the pointer.
 
 ## Let the user watch: serve
 
@@ -63,7 +86,7 @@ All CLI commands print one JSON line on success and exit non-zero with a message
 - On macOS there is one mouse pointer and one keyboard focus for all displays. Clicking or typing on your
   display still moves the user's pointer and can take focus. For browsers, prefer Playwright or the
   Chrome DevTools Protocol, which do not move the pointer. Warn the user before long click-driven work.
-- `open` needs Accessibility permission, and `shot`/`record` need Screen Recording permission, for the
+- `open` and the input commands need Accessibility permission, and `shot`/`record` need Screen Recording permission, for the
   app that runs the agent (Terminal, T3 Code, ...). On a permission error, tell the user which
   setting to turn on: System Settings > Privacy & Security.
 - Never remove a display you did not create. `display_list` / `agent-display list` show all displays,
